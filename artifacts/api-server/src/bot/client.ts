@@ -513,23 +513,13 @@ async function handleHistoryModal(
 async function checkExpiry(): Promise<void> {
   const now = new Date();
   try {
+    // Only warnings auto-expire after 7 days.
+    // Blacklists are PERMANENT — they never expire automatically.
     await db
       .update(warningsTable)
       .set({ active: false })
       .where(
         and(eq(warningsTable.active, true), lt(warningsTable.expiresAt, now)),
-      );
-
-    // Permanent bans have NULL expiresAt. PostgreSQL evaluates NULL < now()
-    // as NULL (falsy), so permanent rows are untouched by this query.
-    await db
-      .update(blacklistTable)
-      .set({ active: false })
-      .where(
-        and(
-          eq(blacklistTable.active, true),
-          lt(blacklistTable.expiresAt, now),
-        ),
       );
   } catch (err) {
     logger.error({ err }, "Error during expiry check");
