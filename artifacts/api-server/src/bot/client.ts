@@ -2,8 +2,6 @@ import {
   Client,
   GatewayIntentBits,
   ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
@@ -14,7 +12,6 @@ import {
   Colors,
   PermissionFlagsBits,
   type Interaction,
-  type ButtonInteraction,
   type ModalSubmitInteraction,
   type ChatInputCommandInteraction,
   type GuildMember,
@@ -30,8 +27,7 @@ const CLIENT_ID = process.env["DISCORD_CLIENT_ID"];
 export const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 // ─── Permission check ─────────────────────────────────────────────────────────
-// Only members with ManageGuild (Управление сервером) or Administrator may
-// use punishment commands.  Returns true if allowed, false otherwise.
+
 function hasModPermission(member: GuildMember | null): boolean {
   if (!member) return false;
   return (
@@ -41,11 +37,11 @@ function hasModPermission(member: GuildMember | null): boolean {
 }
 
 async function denyAccess(
-  interaction: ButtonInteraction | ModalSubmitInteraction | ChatInputCommandInteraction,
+  interaction: ChatInputCommandInteraction | ModalSubmitInteraction,
 ): Promise<void> {
   await interaction.reply({
     content:
-      "⛔ У вас нет прав для использования этой команды.\nТребуется роль с правом **Управление сервером** или **Администратор**.",
+      "⛔ У вас нет прав для использования этой команды.\nТребуется право **Управление сервером** или **Администратор**.",
     ephemeral: true,
   });
 }
@@ -54,20 +50,61 @@ async function denyAccess(
 
 async function registerCommands(clientId: string, token: string): Promise<void> {
   const rest = new REST().setToken(token);
+
+  const modPerm = String(PermissionFlagsBits.ManageGuild);
+
   const commands = [
     new SlashCommandBuilder()
-      .setName("panel")
-      .setDescription("Открыть панель управления семьёй")
-      .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-      .toJSON(),
-  ];
+      .setName("blacklist")
+      .setDescription("⛔ Выдать чёрный список игроку")
+      .setDefaultMemberPermissions(modPerm),
+
+    new SlashCommandBuilder()
+      .setName("unblacklist")
+      .setDescription("✅ Снять чёрный список с игрока")
+      .setDefaultMemberPermissions(modPerm)
+      .addStringOption((opt) =>
+        opt
+          .setName("nickname")
+          .setDescription("Никнейм игрока")
+          .setRequired(true),
+      ),
+
+    new SlashCommandBuilder()
+      .setName("warn")
+      .setDescription("⚠️ Выдать предупреждение игроку (действует 7 дней)")
+      .setDefaultMemberPermissions(modPerm),
+
+    new SlashCommandBuilder()
+      .setName("unwarn")
+      .setDescription("🟢 Снять предупреждение с игрока")
+      .setDefaultMemberPermissions(modPerm)
+      .addStringOption((opt) =>
+        opt
+          .setName("nickname")
+          .setDescription("Никнейм игрока")
+          .setRequired(true),
+      ),
+
+    new SlashCommandBuilder()
+      .setName("history")
+      .setDescription("📋 История наказаний игрока")
+      .setDefaultMemberPermissions(modPerm)
+      .addStringOption((opt) =>
+        opt
+          .setName("nickname")
+          .setDescription("Никнейм игрока")
+          .setRequired(true),
+      ),
+  ].map((c) => c.toJSON());
+
   await rest.put(Routes.applicationCommands(clientId), { body: commands });
   logger.info("Discord slash commands registered globally");
 }
 
-// ─── /panel ───────────────────────────────────────────────────────────────────
+// ─── /blacklist ───────────────────────────────────────────────────────────────
 
-async function handlePanelCommand(
+async function handleBlacklistCommand(
   interaction: ChatInputCommandInteraction,
 ): Promise<void> {
   if (!hasModPermission(interaction.member as GuildMember | null)) {
@@ -75,38 +112,9 @@ async function handlePanelCommand(
     return;
   }
 
-  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder()
-      .setCustomId("blacklist_btn")
-      .setLabel("⛔ Выдать ЧС")
-      .setStyle(ButtonStyle.Danger),
-    new ButtonBuilder()
-      .setCustomId("warning_btn")
-      .setLabel("⚠️ Предупреждение")
-      .setStyle(ButtonStyle.Primary),
-    new ButtonBuilder()
-      .setCustomId("history_btn")
-      .setLabel("📋 История")
-      .setStyle(ButtonStyle.Secondary),
-  );
-
-  await interaction.reply({
-    content: "**🏠 Панель управления семьёй**\nВыберите действие:",
-    components: [row],
-  });
-}
-
-// ─── Buttons → Modals ─────────────────────────────────────────────────────────
-
-async function handleBlacklistButton(interaction: ButtonInteraction): Promise<void> {
-  if (!hasModPermission(interaction.member as GuildMember | null)) {
-    await denyAccess(interaction);
-    return;
-  }
-
   const modal = new ModalBuilder()
     .setCustomId("blacklist_modal")
-    .setTitle("⛔ Выдача ЧС");
+    .setTitle("⛔ Выдача чёрного списка");
 
   modal.addComponents(
     new ActionRowBuilder<TextInputBuilder>().addComponents(
@@ -154,14 +162,157 @@ async function handleBlacklistButton(interaction: ButtonInteraction): Promise<vo
   await interaction.showModal(modal);
 }
 
-async function handleWarningButton(interaction: ButtonInteraction): Promise<void> {
+async function handleBlacklistModal(
+  interaction: ModalSubmitInteraction,
+): Promise<void> {
+  if (!hasModPermission(interaction.member as GuildMember | null)) {
+    await denyAccess(interaction);
+    return;
+  }
+
+  const nickname = interaction.fields.getTextInputValue("nickname").trim();
+  const reason = interaction.fields.getTextInputValue("reason").trim();
+  const daysStr = interaction.fields.getTextInputValue("days").trim();
+  const amnestyRaw = interaction.fields
+    .getTextInputValue("amnesty")
+    .trim()
+    .toLowerCase();
+  const issuedBy = interaction.fields.getTextInputValue("issued_by").trim();
+  const guildId = interaction.guildId ?? "global";
+
+  const days = parseInt(daysStr, 10);
+  if (isNaN(days) || days < 0) {
+    await interaction.reply({
+      content: "❌ Укажите корректное количество дней (число ≥ 0).",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const amnesty = amnestyRaw === "да" || amnestyRaw === "yes";
+
+  // Check for already-active blacklist
+  const existing = await db
+    .select({ id: blacklistTable.id })
+    .from(blacklistTable)
+    .where(
+      and(
+        eq(blacklistTable.nickname, nickname),
+        eq(blacklistTable.guildId, guildId),
+        eq(blacklistTable.active, true),
+      ),
+    )
+    .limit(1);
+
+  if (existing.length > 0) {
+    await interaction.reply({
+      content: `⚠️ Игрок **${nickname}** уже в активном чёрном списке.`,
+      ephemeral: true,
+    });
+    return;
+  }
+
+  await db.insert(blacklistTable).values({
+    nickname,
+    reason,
+    days,
+    amnesty,
+    issuedBy,
+    guildId,
+    expiresAt: null, // ЧС никогда не снимается автоматически
+    active: true,
+  });
+
+  const embed = new EmbedBuilder()
+    .setTitle("⛔️ Чёрный список семьи ⛔️")
+    .setColor(Colors.Red)
+    .addFields(
+      { name: "Никнейм", value: nickname, inline: true },
+      { name: "Причина ЧС", value: reason },
+      {
+        name: "На сколько дней",
+        value: days === 0 ? "Навсегда ♾️" : `${days} дней`,
+        inline: true,
+      },
+      {
+        name: "Возможна амнистия",
+        value: amnesty ? "Да ✅" : "Нет ❌",
+        inline: true,
+      },
+      { name: "От кого выдана ЧС", value: issuedBy, inline: true },
+    )
+    .setTimestamp()
+    .setFooter({ text: "Семейный чёрный список" });
+
+  await interaction.reply({ embeds: [embed] });
+}
+
+// ─── /unblacklist ─────────────────────────────────────────────────────────────
+
+async function handleUnblacklistCommand(
+  interaction: ChatInputCommandInteraction,
+): Promise<void> {
+  if (!hasModPermission(interaction.member as GuildMember | null)) {
+    await denyAccess(interaction);
+    return;
+  }
+
+  const nickname = interaction.options.getString("nickname", true).trim();
+  const guildId = interaction.guildId ?? "global";
+
+  const active = await db
+    .select({ id: blacklistTable.id })
+    .from(blacklistTable)
+    .where(
+      and(
+        eq(blacklistTable.nickname, nickname),
+        eq(blacklistTable.guildId, guildId),
+        eq(blacklistTable.active, true),
+      ),
+    )
+    .limit(1);
+
+  if (active.length === 0) {
+    await interaction.reply({
+      content: `ℹ️ У игрока **${nickname}** нет активного чёрного списка.`,
+      ephemeral: true,
+    });
+    return;
+  }
+
+  await db
+    .update(blacklistTable)
+    .set({ active: false })
+    .where(
+      and(
+        eq(blacklistTable.nickname, nickname),
+        eq(blacklistTable.guildId, guildId),
+        eq(blacklistTable.active, true),
+      ),
+    );
+
+  const embed = new EmbedBuilder()
+    .setTitle("✅ Чёрный список снят")
+    .setColor(Colors.Green)
+    .addFields({ name: "Игрок", value: nickname, inline: true })
+    .setTimestamp()
+    .setFooter({ text: `Снял: ${interaction.user.username}` });
+
+  await interaction.reply({ embeds: [embed] });
+}
+
+// ─── /warn ────────────────────────────────────────────────────────────────────
+
+async function handleWarnCommand(
+  interaction: ChatInputCommandInteraction,
+): Promise<void> {
   if (!hasModPermission(interaction.member as GuildMember | null)) {
     await denyAccess(interaction);
     return;
   }
 
   const modal = new ModalBuilder()
-    .setCustomId("warning_modal")
+    .setCustomId("warn_modal")
     .setTitle("⚠️ Выдача предупреждения");
 
   modal.addComponents(
@@ -194,120 +345,7 @@ async function handleWarningButton(interaction: ButtonInteraction): Promise<void
   await interaction.showModal(modal);
 }
 
-async function handleHistoryButton(interaction: ButtonInteraction): Promise<void> {
-  if (!hasModPermission(interaction.member as GuildMember | null)) {
-    await denyAccess(interaction);
-    return;
-  }
-
-  const modal = new ModalBuilder()
-    .setCustomId("history_modal")
-    .setTitle("📋 История наказаний");
-
-  modal.addComponents(
-    new ActionRowBuilder<TextInputBuilder>().addComponents(
-      new TextInputBuilder()
-        .setCustomId("nickname")
-        .setLabel("Никнейм игрока")
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true)
-        .setPlaceholder("Введите никнейм"),
-    ),
-  );
-
-  await interaction.showModal(modal);
-}
-
-// ─── Modal submit handlers ────────────────────────────────────────────────────
-
-async function handleBlacklistModal(
-  interaction: ModalSubmitInteraction,
-): Promise<void> {
-  if (!hasModPermission(interaction.member as GuildMember | null)) {
-    await denyAccess(interaction);
-    return;
-  }
-
-  const nickname = interaction.fields.getTextInputValue("nickname").trim();
-  const reason = interaction.fields.getTextInputValue("reason").trim();
-  const daysStr = interaction.fields.getTextInputValue("days").trim();
-  const amnestyRaw = interaction.fields
-    .getTextInputValue("amnesty")
-    .trim()
-    .toLowerCase();
-  const issuedBy = interaction.fields.getTextInputValue("issued_by").trim();
-  const guildId = interaction.guildId ?? "global";
-
-  const days = parseInt(daysStr, 10);
-  if (isNaN(days) || days < 0) {
-    await interaction.reply({
-      content: "❌ Укажите корректное количество дней (число ≥ 0).",
-      ephemeral: true,
-    });
-    return;
-  }
-
-  const amnesty = amnestyRaw === "да" || amnestyRaw === "yes";
-  const expiresAt =
-    days > 0 ? new Date(Date.now() + days * 24 * 60 * 60 * 1000) : null;
-
-  // Check for already-active blacklist to prevent duplicates
-  const existing = await db
-    .select({ id: blacklistTable.id })
-    .from(blacklistTable)
-    .where(
-      and(
-        eq(blacklistTable.nickname, nickname),
-        eq(blacklistTable.guildId, guildId),
-        eq(blacklistTable.active, true),
-      ),
-    )
-    .limit(1);
-
-  if (existing.length > 0) {
-    await interaction.reply({
-      content: `⚠️ Игрок **${nickname}** уже находится в активном чёрном списке.`,
-      ephemeral: true,
-    });
-    return;
-  }
-
-  await db.insert(blacklistTable).values({
-    nickname,
-    reason,
-    days,
-    amnesty,
-    issuedBy,
-    guildId,
-    expiresAt,
-    active: true,
-  });
-
-  const embed = new EmbedBuilder()
-    .setTitle("⛔️ Чёрный список семьи ⛔️")
-    .setColor(Colors.Red)
-    .addFields(
-      { name: "Никнейм", value: nickname, inline: true },
-      { name: "Причина ЧС", value: reason },
-      {
-        name: "На сколько дней",
-        value: days === 0 ? "Навсегда ♾️" : `${days} дней`,
-        inline: true,
-      },
-      {
-        name: "Возможна амнистия",
-        value: amnesty ? "Да ✅" : "Нет ❌",
-        inline: true,
-      },
-      { name: "От кого выдана ЧС", value: issuedBy, inline: true },
-    )
-    .setTimestamp()
-    .setFooter({ text: "Семейный чёрный список" });
-
-  await interaction.reply({ embeds: [embed] });
-}
-
-async function handleWarningModal(
+async function handleWarnModal(
   interaction: ModalSubmitInteraction,
 ): Promise<void> {
   if (!hasModPermission(interaction.member as GuildMember | null)) {
@@ -321,7 +359,6 @@ async function handleWarningModal(
   const guildId = interaction.guildId ?? "global";
   const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 
-  // Atomic transaction: insert warning, count, optionally auto-blacklist
   let count = 0;
   let autoBlacklisted = false;
 
@@ -349,7 +386,6 @@ async function handleWarningModal(
     count = rows.length;
 
     if (count >= 3) {
-      // Only auto-blacklist if no active blacklist already exists
       const existingBL = await tx
         .select({ id: blacklistTable.id })
         .from(blacklistTable)
@@ -376,7 +412,6 @@ async function handleWarningModal(
         autoBlacklisted = true;
       }
 
-      // Deactivate all warnings for this player in this guild
       await tx
         .update(warningsTable)
         .set({ active: false })
@@ -390,7 +425,6 @@ async function handleWarningModal(
     }
   });
 
-  // Clamp display count to 3 (race-safe)
   const displayCount = Math.min(count, 3);
   const filled = "🟡".repeat(displayCount);
   const empty = "⚪".repeat(3 - displayCount);
@@ -414,23 +448,100 @@ async function handleWarningModal(
   if (autoBlacklisted) {
     embed.addFields({
       name: "⛔ АВТОМАТИЧЕСКИЙ ЧС ВЫДАН",
-      value:
-        "Игрок набрал **3/3** предупреждений и автоматически внесён в чёрный список!",
+      value: "Игрок набрал **3/3** предупреждений и автоматически внесён в чёрный список!",
     });
   }
 
   await interaction.reply({ embeds: [embed] });
 }
 
-async function handleHistoryModal(
-  interaction: ModalSubmitInteraction,
+// ─── /unwarn ──────────────────────────────────────────────────────────────────
+
+async function handleUnwarnCommand(
+  interaction: ChatInputCommandInteraction,
 ): Promise<void> {
   if (!hasModPermission(interaction.member as GuildMember | null)) {
     await denyAccess(interaction);
     return;
   }
 
-  const nickname = interaction.fields.getTextInputValue("nickname").trim();
+  const nickname = interaction.options.getString("nickname", true).trim();
+  const guildId = interaction.guildId ?? "global";
+
+  // Find the most recent active warning
+  const recent = await db
+    .select()
+    .from(warningsTable)
+    .where(
+      and(
+        eq(warningsTable.nickname, nickname),
+        eq(warningsTable.guildId, guildId),
+        eq(warningsTable.active, true),
+      ),
+    )
+    .orderBy(desc(warningsTable.issuedAt))
+    .limit(1);
+
+  if (recent.length === 0) {
+    await interaction.reply({
+      content: `ℹ️ У игрока **${nickname}** нет активных предупреждений.`,
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const warning = recent[0]!;
+
+  await db
+    .update(warningsTable)
+    .set({ active: false })
+    .where(eq(warningsTable.id, warning.id));
+
+  // Count remaining active warnings
+  const remaining = await db
+    .select({ id: warningsTable.id })
+    .from(warningsTable)
+    .where(
+      and(
+        eq(warningsTable.nickname, nickname),
+        eq(warningsTable.guildId, guildId),
+        eq(warningsTable.active, true),
+      ),
+    );
+
+  const left = remaining.length;
+  const filled = "🟡".repeat(left);
+  const empty = "⚪".repeat(Math.max(0, 3 - left));
+
+  const embed = new EmbedBuilder()
+    .setTitle("🟢 Предупреждение снято")
+    .setColor(Colors.Green)
+    .addFields(
+      { name: "Игрок", value: nickname, inline: true },
+      {
+        name: "Осталось предупреждений",
+        value: `${left}/3 ${filled}${empty}`,
+        inline: true,
+      },
+      { name: "Снятое предупреждение", value: warning.reason },
+    )
+    .setTimestamp()
+    .setFooter({ text: `Снял: ${interaction.user.username}` });
+
+  await interaction.reply({ embeds: [embed] });
+}
+
+// ─── /history ─────────────────────────────────────────────────────────────────
+
+async function handleHistoryCommand(
+  interaction: ChatInputCommandInteraction,
+): Promise<void> {
+  if (!hasModPermission(interaction.member as GuildMember | null)) {
+    await denyAccess(interaction);
+    return;
+  }
+
+  const nickname = interaction.options.getString("nickname", true).trim();
   const guildId = interaction.guildId ?? "global";
 
   const [blacklistHistory, warningHistory] = await Promise.all([
@@ -474,7 +585,7 @@ async function handleHistoryModal(
   if (blacklistHistory.length > 0) {
     const lines = blacklistHistory.map((bl, i) => {
       const date = bl.issuedAt.toLocaleDateString("ru-RU");
-      const status = bl.active ? "🔴 Активен" : "⚫ Истёк";
+      const status = bl.active ? "🔴 Активен" : "⚫ Снят";
       const duration = bl.days === 0 ? "Навсегда" : `${bl.days} дн.`;
       const amnestyLabel = bl.amnesty ? "Да" : "Нет";
       return (
@@ -508,13 +619,13 @@ async function handleHistoryModal(
   await interaction.reply({ embeds: [embed], ephemeral: true });
 }
 
-// ─── Auto-expiry (every 10 minutes) ──────────────────────────────────────────
+// ─── Auto-expiry (every 10 min) ───────────────────────────────────────────────
 
 async function checkExpiry(): Promise<void> {
   const now = new Date();
   try {
-    // Only warnings auto-expire after 7 days.
-    // Blacklists are PERMANENT — they never expire automatically.
+    // Только предупреждения снимаются автоматически через 7 дней.
+    // ЧС никогда не снимается автоматически.
     await db
       .update(warningsTable)
       .set({ active: false })
@@ -541,10 +652,7 @@ export async function startBot(): Promise<void> {
     try {
       await registerCommands(CLIENT_ID, TOKEN);
     } catch (err) {
-      logger.error(
-        { err },
-        "Failed to register slash commands — check DISCORD_CLIENT_ID (must be the numeric Application ID)",
-      );
+      logger.error({ err }, "Failed to register slash commands");
     }
     setInterval(() => void checkExpiry(), 10 * 60 * 1000);
     await checkExpiry();
@@ -557,47 +665,32 @@ export async function startBot(): Promise<void> {
   client.on("interactionCreate", async (interaction: Interaction) => {
     try {
       if (interaction.isChatInputCommand()) {
-        if (interaction.commandName === "panel") {
-          await handlePanelCommand(interaction);
-        }
-      } else if (interaction.isButton()) {
-        if (interaction.customId === "blacklist_btn") {
-          await handleBlacklistButton(interaction);
-        } else if (interaction.customId === "warning_btn") {
-          await handleWarningButton(interaction);
-        } else if (interaction.customId === "history_btn") {
-          await handleHistoryButton(interaction);
+        switch (interaction.commandName) {
+          case "blacklist":   await handleBlacklistCommand(interaction); break;
+          case "unblacklist": await handleUnblacklistCommand(interaction); break;
+          case "warn":        await handleWarnCommand(interaction); break;
+          case "unwarn":      await handleUnwarnCommand(interaction); break;
+          case "history":     await handleHistoryCommand(interaction); break;
         }
       } else if (interaction.isModalSubmit()) {
-        if (interaction.customId === "blacklist_modal") {
-          await handleBlacklistModal(interaction);
-        } else if (interaction.customId === "warning_modal") {
-          await handleWarningModal(interaction);
-        } else if (interaction.customId === "history_modal") {
-          await handleHistoryModal(interaction);
+        switch (interaction.customId) {
+          case "blacklist_modal": await handleBlacklistModal(interaction); break;
+          case "warn_modal":      await handleWarnModal(interaction); break;
         }
       }
     } catch (err) {
       logger.error({ err }, "Discord interaction error");
       try {
-        const msg = {
-          content: "❌ Произошла ошибка. Попробуйте снова.",
-          ephemeral: true,
-        };
+        const msg = { content: "❌ Произошла ошибка. Попробуйте снова.", ephemeral: true };
         if (interaction.isRepliable()) {
-          const i = interaction as typeof interaction & {
-            replied?: boolean;
-            deferred?: boolean;
-          };
+          const i = interaction as typeof interaction & { replied?: boolean; deferred?: boolean };
           if (i.replied || i.deferred) {
             await (interaction as any).followUp(msg);
           } else {
             await (interaction as any).reply(msg);
           }
         }
-      } catch {
-        // ignore secondary error
-      }
+      } catch { /* ignore */ }
     }
   });
 
