@@ -446,11 +446,19 @@ export async function startBot(): Promise<void> {
     return;
   }
 
-  client.once("ready", async () => {
+  client.once("clientReady", async () => {
     logger.info({ tag: client.user?.tag }, "Discord bot ready");
-    await registerCommands(CLIENT_ID, TOKEN);
+    try {
+      await registerCommands(CLIENT_ID, TOKEN);
+    } catch (err) {
+      logger.error({ err }, "Failed to register Discord slash commands — check DISCORD_CLIENT_ID (must be the numeric Application ID, not the token)");
+    }
     setInterval(() => void checkExpiry(), 10 * 60 * 1000);
     await checkExpiry();
+  });
+
+  client.on("error", (err) => {
+    logger.error({ err }, "Discord client error");
   });
 
   client.on("interactionCreate", async (interaction: Interaction) => {
