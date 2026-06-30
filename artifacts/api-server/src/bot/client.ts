@@ -12,10 +12,12 @@ import {
   Routes,
   SlashCommandBuilder,
   Colors,
+  PermissionFlagsBits,
   type Interaction,
   type ButtonInteraction,
   type ModalSubmitInteraction,
   type ChatInputCommandInteraction,
+  type GuildMember,
 } from "discord.js";
 import { db } from "@workspace/db";
 import { blacklistTable, warningsTable } from "@workspace/db";
@@ -27,23 +29,52 @@ const CLIENT_ID = process.env["DISCORD_CLIENT_ID"];
 
 export const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-async function registerCommands(clientId: string, token: string) {
+// ─── Permission check ─────────────────────────────────────────────────────────
+// Only members with ManageGuild (Управление сервером) or Administrator may
+// use punishment commands.  Returns true if allowed, false otherwise.
+function hasModPermission(member: GuildMember | null): boolean {
+  if (!member) return false;
+  return (
+    member.permissions.has(PermissionFlagsBits.ManageGuild) ||
+    member.permissions.has(PermissionFlagsBits.Administrator)
+  );
+}
+
+async function denyAccess(
+  interaction: ButtonInteraction | ModalSubmitInteraction | ChatInputCommandInteraction,
+): Promise<void> {
+  await interaction.reply({
+    content:
+      "⛔ У вас нет прав для использования этой команды.\nТребуется роль с правом **Управление сервером** или **Администратор**.",
+    ephemeral: true,
+  });
+}
+
+// ─── Command registration ─────────────────────────────────────────────────────
+
+async function registerCommands(clientId: string, token: string): Promise<void> {
   const rest = new REST().setToken(token);
   const commands = [
     new SlashCommandBuilder()
       .setName("panel")
       .setDescription("Открыть панель управления семьёй")
+      .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
       .toJSON(),
   ];
   await rest.put(Routes.applicationCommands(clientId), { body: commands });
   logger.info("Discord slash commands registered globally");
 }
 
-// ─── /panel handler ──────────────────────────────────────────────────────────
+// ─── /panel ───────────────────────────────────────────────────────────────────
 
 async function handlePanelCommand(
   interaction: ChatInputCommandInteraction,
 ): Promise<void> {
+  if (!hasModPermission(interaction.member as GuildMember | null)) {
+    await denyAccess(interaction);
+    return;
+  }
+
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId("blacklist_btn")
@@ -65,16 +96,19 @@ async function handlePanelCommand(
   });
 }
 
-// ─── Modals ──────────────────────────────────────────────────────────────────
+// ─── Buttons → Modals ─────────────────────────────────────────────────────────
 
-async function handleBlacklistButton(
-  interaction: ButtonInteraction,
-): Promise<void> {
+async function handleBlacklistButton(interaction: ButtonInteraction): Promise<void> {
+  if (!hasModPermission(interaction.member as GuildMember | null)) {
+    await denyAccess(interaction);
+    return;
+  }
+
   const modal = new ModalBuilder()
     .setCustomId("blacklist_modal")
     .setTitle("⛔ Выдача ЧС");
 
-  const rows = [
+  modal.addComponents(
     new ActionRowBuilder<TextInputBuilder>().addComponents(
       new TextInputBuilder()
         .setCustomId("nickname")
@@ -115,20 +149,22 @@ async function handleBlacklistButton(
         .setRequired(true)
         .setPlaceholder("Введите никнейм выдавшего"),
     ),
-  ];
+  );
 
-  modal.addComponents(...rows);
   await interaction.showModal(modal);
 }
 
-async function handleWarningButton(
-  interaction: ButtonInteraction,
-): Promise<void> {
+async function handleWarningButton(interaction: ButtonInteraction): Promise<void> {
+  if (!hasModPermission(interaction.member as GuildMember | null)) {
+    await denyAccess(interaction);
+    return;
+  }
+
   const modal = new ModalBuilder()
     .setCustomId("warning_modal")
     .setTitle("⚠️ Выдача предупреждения");
 
-  const rows = [
+  modal.addComponents(
     new ActionRowBuilder<TextInputBuilder>().addComponents(
       new TextInputBuilder()
         .setCustomId("nickname")
@@ -153,15 +189,17 @@ async function handleWarningButton(
         .setRequired(true)
         .setPlaceholder("Введите никнейм выдавшего"),
     ),
-  ];
+  );
 
-  modal.addComponents(...rows);
   await interaction.showModal(modal);
 }
 
-async function handleHistoryButton(
-  interaction: ButtonInteraction,
-): Promise<void> {
+async function handleHistoryButton(interaction: ButtonInteraction): Promise<void> {
+  if (!hasModPermission(interaction.member as GuildMember | null)) {
+    await denyAccess(interaction);
+    return;
+  }
+
   const modal = new ModalBuilder()
     .setCustomId("history_modal")
     .setTitle("📋 История наказаний");
@@ -185,6 +223,11 @@ async function handleHistoryButton(
 async function handleBlacklistModal(
   interaction: ModalSubmitInteraction,
 ): Promise<void> {
+  if (!hasModPermission(interaction.member as GuildMember | null)) {
+    await denyAccess(interaction);
+    return;
+  }
+
   const nickname = interaction.fields.getTextInputValue("nickname").trim();
   const reason = interaction.fields.getTextInputValue("reason").trim();
   const daysStr = interaction.fields.getTextInputValue("days").trim();
@@ -208,6 +251,27 @@ async function handleBlacklistModal(
   const expiresAt =
     days > 0 ? new Date(Date.now() + days * 24 * 60 * 60 * 1000) : null;
 
+  // Check for already-active blacklist to prevent duplicates
+  const existing = await db
+    .select({ id: blacklistTable.id })
+    .from(blacklistTable)
+    .where(
+      and(
+        eq(blacklistTable.nickname, nickname),
+        eq(blacklistTable.guildId, guildId),
+        eq(blacklistTable.active, true),
+      ),
+    )
+    .limit(1);
+
+  if (existing.length > 0) {
+    await interaction.reply({
+      content: `⚠️ Игрок **${nickname}** уже находится в активном чёрном списке.`,
+      ephemeral: true,
+    });
+    return;
+  }
+
   await db.insert(blacklistTable).values({
     nickname,
     reason,
@@ -230,7 +294,11 @@ async function handleBlacklistModal(
         value: days === 0 ? "Навсегда ♾️" : `${days} дней`,
         inline: true,
       },
-      { name: "Возможна амнистия", value: amnesty ? "Да ✅" : "Нет ❌", inline: true },
+      {
+        name: "Возможна амнистия",
+        value: amnesty ? "Да ✅" : "Нет ❌",
+        inline: true,
+      },
       { name: "От кого выдана ЧС", value: issuedBy, inline: true },
     )
     .setTimestamp()
@@ -242,69 +310,34 @@ async function handleBlacklistModal(
 async function handleWarningModal(
   interaction: ModalSubmitInteraction,
 ): Promise<void> {
+  if (!hasModPermission(interaction.member as GuildMember | null)) {
+    await denyAccess(interaction);
+    return;
+  }
+
   const nickname = interaction.fields.getTextInputValue("nickname").trim();
   const reason = interaction.fields.getTextInputValue("reason").trim();
   const issuedBy = interaction.fields.getTextInputValue("issued_by").trim();
   const guildId = interaction.guildId ?? "global";
-
   const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 
-  await db.insert(warningsTable).values({
-    nickname,
-    reason,
-    issuedBy,
-    guildId,
-    expiresAt,
-    active: true,
-  });
+  // Atomic transaction: insert warning, count, optionally auto-blacklist
+  let count = 0;
+  let autoBlacklisted = false;
 
-  // Count active warnings for this player in this guild
-  const activeWarnings = await db
-    .select()
-    .from(warningsTable)
-    .where(
-      and(
-        eq(warningsTable.nickname, nickname),
-        eq(warningsTable.guildId, guildId),
-        eq(warningsTable.active, true),
-      ),
-    );
-
-  const count = activeWarnings.length;
-
-  const embed = new EmbedBuilder()
-    .setTitle("⚠️ Предупреждение в семье ⚠️")
-    .setColor(Colors.Yellow)
-    .addFields(
-      { name: "Никнейм", value: nickname, inline: true },
-      { name: "Причина", value: reason },
-      {
-        name: "Предупреждений",
-        value: `${count}/3 ${"🟡".repeat(count)}${"⚪".repeat(3 - count)}`,
-        inline: true,
-      },
-      { name: "От кого выдано", value: issuedBy, inline: true },
-    )
-    .setTimestamp()
-    .setFooter({ text: "Предупреждение снимается автоматически через 7 дней" });
-
-  // Auto-blacklist on 3rd warning
-  if (count >= 3) {
-    await db.insert(blacklistTable).values({
+  await db.transaction(async (tx) => {
+    await tx.insert(warningsTable).values({
       nickname,
-      reason: "Автоматический ЧС: набрал 3/3 предупреждений",
-      days: 0,
-      amnesty: false,
-      issuedBy: "🤖 Система",
+      reason,
+      issuedBy,
       guildId,
-      expiresAt: null,
+      expiresAt,
       active: true,
     });
 
-    // Deactivate all warnings for this player
-    await db
-      .update(warningsTable)
-      .set({ active: false })
+    const rows = await tx
+      .select({ id: warningsTable.id })
+      .from(warningsTable)
       .where(
         and(
           eq(warningsTable.nickname, nickname),
@@ -313,13 +346,77 @@ async function handleWarningModal(
         ),
       );
 
-    embed
-      .setColor(Colors.DarkRed)
-      .addFields({
-        name: "⛔ АВТОМАТИЧЕСКИЙ ЧС ВЫДАН",
-        value:
-          "Игрок набрал **3/3** предупреждений и автоматически внесён в чёрный список!",
-      });
+    count = rows.length;
+
+    if (count >= 3) {
+      // Only auto-blacklist if no active blacklist already exists
+      const existingBL = await tx
+        .select({ id: blacklistTable.id })
+        .from(blacklistTable)
+        .where(
+          and(
+            eq(blacklistTable.nickname, nickname),
+            eq(blacklistTable.guildId, guildId),
+            eq(blacklistTable.active, true),
+          ),
+        )
+        .limit(1);
+
+      if (existingBL.length === 0) {
+        await tx.insert(blacklistTable).values({
+          nickname,
+          reason: "Автоматический ЧС: набрал 3/3 предупреждений",
+          days: 0,
+          amnesty: false,
+          issuedBy: "🤖 Система",
+          guildId,
+          expiresAt: null,
+          active: true,
+        });
+        autoBlacklisted = true;
+      }
+
+      // Deactivate all warnings for this player in this guild
+      await tx
+        .update(warningsTable)
+        .set({ active: false })
+        .where(
+          and(
+            eq(warningsTable.nickname, nickname),
+            eq(warningsTable.guildId, guildId),
+            eq(warningsTable.active, true),
+          ),
+        );
+    }
+  });
+
+  // Clamp display count to 3 (race-safe)
+  const displayCount = Math.min(count, 3);
+  const filled = "🟡".repeat(displayCount);
+  const empty = "⚪".repeat(3 - displayCount);
+
+  const embed = new EmbedBuilder()
+    .setTitle("⚠️ Предупреждение в семье ⚠️")
+    .setColor(autoBlacklisted ? Colors.DarkRed : Colors.Yellow)
+    .addFields(
+      { name: "Никнейм", value: nickname, inline: true },
+      { name: "Причина", value: reason },
+      {
+        name: "Предупреждений",
+        value: `${displayCount}/3 ${filled}${empty}`,
+        inline: true,
+      },
+      { name: "От кого выдано", value: issuedBy, inline: true },
+    )
+    .setTimestamp()
+    .setFooter({ text: "Предупреждение снимается автоматически через 7 дней" });
+
+  if (autoBlacklisted) {
+    embed.addFields({
+      name: "⛔ АВТОМАТИЧЕСКИЙ ЧС ВЫДАН",
+      value:
+        "Игрок набрал **3/3** предупреждений и автоматически внесён в чёрный список!",
+    });
   }
 
   await interaction.reply({ embeds: [embed] });
@@ -328,6 +425,11 @@ async function handleWarningModal(
 async function handleHistoryModal(
   interaction: ModalSubmitInteraction,
 ): Promise<void> {
+  if (!hasModPermission(interaction.member as GuildMember | null)) {
+    await denyAccess(interaction);
+    return;
+  }
+
   const nickname = interaction.fields.getTextInputValue("nickname").trim();
   const guildId = interaction.guildId ?? "global";
 
@@ -373,11 +475,10 @@ async function handleHistoryModal(
     const lines = blacklistHistory.map((bl, i) => {
       const date = bl.issuedAt.toLocaleDateString("ru-RU");
       const status = bl.active ? "🔴 Активен" : "⚫ Истёк";
-      const duration =
-        bl.days === 0 ? "Навсегда" : `${bl.days} дн.`;
-      const amnesty = bl.amnesty ? "Да" : "Нет";
+      const duration = bl.days === 0 ? "Навсегда" : `${bl.days} дн.`;
+      const amnestyLabel = bl.amnesty ? "Да" : "Нет";
       return (
-        `**${i + 1}.** ${status} · ${date} · ${duration} · Амнистия: ${amnesty}\n` +
+        `**${i + 1}.** ${status} · ${date} · ${duration} · Амнистия: ${amnestyLabel}\n` +
         `> Причина: ${bl.reason}\n` +
         `> От: ${bl.issuedBy}`
       );
@@ -407,12 +508,11 @@ async function handleHistoryModal(
   await interaction.reply({ embeds: [embed], ephemeral: true });
 }
 
-// ─── Auto-expiry ──────────────────────────────────────────────────────────────
+// ─── Auto-expiry (every 10 minutes) ──────────────────────────────────────────
 
 async function checkExpiry(): Promise<void> {
   const now = new Date();
   try {
-    // Expire warnings that passed their 7-day deadline
     await db
       .update(warningsTable)
       .set({ active: false })
@@ -420,8 +520,8 @@ async function checkExpiry(): Promise<void> {
         and(eq(warningsTable.active, true), lt(warningsTable.expiresAt, now)),
       );
 
-    // Expire timed blacklists — NULL expiresAt means permanent, PostgreSQL
-    // evaluates NULL < now() as NULL (falsy) so permanent rows are untouched.
+    // Permanent bans have NULL expiresAt. PostgreSQL evaluates NULL < now()
+    // as NULL (falsy), so permanent rows are untouched by this query.
     await db
       .update(blacklistTable)
       .set({ active: false })
@@ -451,7 +551,10 @@ export async function startBot(): Promise<void> {
     try {
       await registerCommands(CLIENT_ID, TOKEN);
     } catch (err) {
-      logger.error({ err }, "Failed to register Discord slash commands — check DISCORD_CLIENT_ID (must be the numeric Application ID, not the token)");
+      logger.error(
+        { err },
+        "Failed to register slash commands — check DISCORD_CLIENT_ID (must be the numeric Application ID)",
+      );
     }
     setInterval(() => void checkExpiry(), 10 * 60 * 1000);
     await checkExpiry();
@@ -487,9 +590,15 @@ export async function startBot(): Promise<void> {
     } catch (err) {
       logger.error({ err }, "Discord interaction error");
       try {
-        const msg = { content: "❌ Произошла ошибка. Попробуйте снова.", ephemeral: true };
+        const msg = {
+          content: "❌ Произошла ошибка. Попробуйте снова.",
+          ephemeral: true,
+        };
         if (interaction.isRepliable()) {
-          const i = interaction as { replied?: boolean; deferred?: boolean } & typeof interaction;
+          const i = interaction as typeof interaction & {
+            replied?: boolean;
+            deferred?: boolean;
+          };
           if (i.replied || i.deferred) {
             await (interaction as any).followUp(msg);
           } else {
