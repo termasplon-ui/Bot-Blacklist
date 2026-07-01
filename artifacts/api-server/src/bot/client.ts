@@ -1,6 +1,7 @@
 import {
   Client,
   GatewayIntentBits,
+  ActivityType,
   ActionRowBuilder,
   ModalBuilder,
   TextInputBuilder,
@@ -766,6 +767,10 @@ export async function startBot(): Promise<void> {
 
   client.once("clientReady", async () => {
     logger.info({ tag: client.user?.tag }, "Discord bot ready");
+    client.user?.setPresence({
+      status: "online",
+      activities: [{ name: "Семейный ЧС", type: ActivityType.Watching }],
+    });
     try {
       await registerCommands(CLIENT_ID, TOKEN);
     } catch (err) {
