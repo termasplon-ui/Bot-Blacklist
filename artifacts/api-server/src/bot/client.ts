@@ -28,12 +28,11 @@ export const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 // ─── Permission check ─────────────────────────────────────────────────────────
 
+const ALLOWED_ROLE_NAME = "🛡️ Blacklist Checker 🛡 Семья";
+
 function hasModPermission(member: GuildMember | null): boolean {
   if (!member) return false;
-  return (
-    member.permissions.has(PermissionFlagsBits.ManageGuild) ||
-    member.permissions.has(PermissionFlagsBits.Administrator)
-  );
+  return member.roles.cache.some((role) => role.name === ALLOWED_ROLE_NAME);
 }
 
 async function denyAccess(
@@ -41,7 +40,7 @@ async function denyAccess(
 ): Promise<void> {
   await interaction.reply({
     content:
-      "⛔ У вас нет прав для использования этой команды.\nТребуется право **Управление сервером** или **Администратор**.",
+      `⛔ У вас нет прав для использования этой команды.\nТребуется роль **${ALLOWED_ROLE_NAME}**.`,
     ephemeral: true,
   });
 }
